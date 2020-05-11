@@ -1,0 +1,100 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: proxy
+rules:
+- apiGroups:
+  - "apps"
+  resources:
+  - statefulsets
+  - statefulsets/scale
+  verbs:
+  - get
+  - update
+  - patch
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: proxy
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: default
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+    name: proxy
+    labels:
+        component: proxy
+    annotations:
+        minProxies: "1"
+        maxProxies: "100"
+        maxRequests: "20"
+        maxLoadFactor: "0.5"
+        proxyTimeout: "100"
+        idleTimeout: "10"
+        debugLevel: "1"
+spec:
+    selector:
+        matchLabels:
+            component: proxy
+    serviceName: "proxy"
+    podManagementPolicy: "Parallel"
+    replicas: 1
+    template:
+        metadata:
+            labels:
+                component: proxy
+        spec:
+            terminationGracePeriodSeconds: 0
+            containers:
+            - name: proxy
+              image: REPO/proxy
+              ports:
+              - containerPort: 80
+                protocol: TCP
+              readinessProbe:
+                httpGet:
+                  path: /
+                  port: 80
+                initialDelaySeconds: 0
+                periodSeconds: 1
+              env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: POD_STATEFULSET
+                  value: proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+  clusterIP: None
+  selector:
+    component: proxy

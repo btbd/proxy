@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sender
+  labels:
+    component: sender
+spec:
+  containers:
+  - name: sender
+    image: REPO/sender
+    ports:
+    - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sender
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+  selector:
+    component: sender
