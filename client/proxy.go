@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +58,9 @@ type Config struct {
 	// This value is used for free count prediction
 	NumberOfSenders uint
 
+	// Attempts is an upper bound of attempts to make a proxy request before giving up
+	Attempts uint
+
 	// PingClient is the HTTP client to use for ping requests
 	PingClient *http.Client
 
@@ -83,6 +87,7 @@ func New(proxyServiceURL string) (*Proxy, error) {
 		Pods:    map[int]*Pod{},
 		Config: Config{
 			NumberOfSenders: 1,
+			Attempts:        math.MaxUint32,
 			PingInterval:    time.Second,
 		},
 	}
@@ -102,6 +107,10 @@ func NewWithConfig(proxyServiceURL string, config Config) (*Proxy, error) {
 
 	if config.NumberOfSenders == 0 {
 		config.NumberOfSenders = proxy.Config.NumberOfSenders
+	}
+
+	if config.Attempts == 0 {
+		config.Attempts = proxy.Config.Attempts
 	}
 
 	if config.PingInterval == 0 {
@@ -403,67 +412,74 @@ func updateKnownProxies(p *Proxy, header *http.Header) (int, error) {
 	return int(proxyStatus), nil
 }
 
+// These errors occur in edge cases where the last proxy terminates just as the client gets a burst of messages
+// This means the client thinks the last proxy is still alive when it actually isn't
+func isRetryError(err error) bool {
+	return strings.Contains(err.Error(), "connection timed out") || strings.Contains(err.Error(), "connection refused")
+}
+
 // Do forwards a non-blocking HTTP request to the proxy
 func (p *Proxy) Do(client *http.Client, req *http.Request) (*http.Response, error) {
-	p.Lock()
+	for attempt := uint(1); ; attempt++ {
+		p.Lock()
 
-	// Determine the best proxy
-	proxyOrdinal, proxyURL, err := p.determineBestProxy()
-	if err != nil {
+		// Determine the best proxy
+		proxyOrdinal, proxyURL, err := p.determineBestProxy()
+		if err != nil {
+			p.Unlock()
+			return nil, err
+		}
+
+		if proxyOrdinal >= 0 {
+			// Decrement free count as a prediction
+			atomic.AddInt64(&p.Pods[proxyOrdinal].Free, -1*int64(p.Config.NumberOfSenders))
+		}
+
+		p.debugPrint(3, "Sending request to proxy %v: %v", proxyOrdinal, proxyURL.String())
 		p.Unlock()
-		return nil, err
+
+		// Do the actual request
+		req.Header.Set("Forward-To", req.URL.String())
+		req.URL = proxyURL
+
+		if transport, ok := client.Transport.(*http.Transport); ok && transport.TLSClientConfig.InsecureSkipVerify {
+			req.Header.Set("Insecure-Skip-Verify", "true")
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if proxyOrdinal >= 0 {
+				p.markProxyPodAsDead(proxyOrdinal)
+
+				// Retry if needed
+				if attempt < p.Config.Attempts && isRetryError(err) {
+					continue
+				}
+			}
+
+			return nil, err
+		}
+
+		// Parse the response
+		_, err = updateKnownProxies(p, &resp.Header)
+		if err != nil {
+			// Only fails if the proxy sends back invalid headers
+			return nil, err
+		}
+
+		// Return response without proxy headers, except Proxy-Status
+		resp.Header.Del("Proxy-Free")
+		resp.Header.Del("Proxy-Ordinal")
+		resp.Header.Del("Proxy-Version")
+		resp.Header.Del("Proxy-List")
+		return resp, nil
 	}
-
-	if proxyOrdinal >= 0 {
-		// Decrement free count as a prediction
-		atomic.AddInt64(&p.Pods[proxyOrdinal].Free, -1*int64(p.Config.NumberOfSenders))
-	}
-
-	p.debugPrint(3, "Sending request to proxy %v: %v", proxyOrdinal, proxyURL.String())
-	p.Unlock()
-
-	// Do the actual request
-	req.Header.Set("Forward-To", req.URL.String())
-	req.URL = proxyURL
-
-	if transport, ok := client.Transport.(*http.Transport); ok && transport.TLSClientConfig.InsecureSkipVerify {
-		req.Header.Set("Insecure-Skip-Verify", "true")
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		p.markProxyPodAsDead(proxyOrdinal)
-		return nil, err
-	}
-
-	// Parse the response
-	_, err = updateKnownProxies(p, &resp.Header)
-	if err != nil {
-		// Only fails if the proxy sends back invalid headers
-		return nil, err
-	}
-
-	// Return response without proxy headers, except Proxy-Status
-	resp.Header.Del("Proxy-Free")
-	resp.Header.Del("Proxy-Ordinal")
-	resp.Header.Del("Proxy-Version")
-	resp.Header.Del("Proxy-List")
-	return resp, nil
 }
 
 // Ensure attempts to ensure there are enough proxies to handle the predicted incoming requests
 func (p *Proxy) Ensure(client *http.Client, ensureRequests int) error {
-	// Determine the best proxy
-	p.Lock()
-	proxyOrdinal, proxyURL, err := p.determineBestProxy()
-	p.Unlock()
-
-	if err != nil {
-		return err
-	}
-
 	// Create the request
-	req, err := http.NewRequest("POST", proxyURL.String(), nil)
+	req, err := http.NewRequest("POST", p.Service.String(), nil)
 	if err != nil {
 		return err
 	}
@@ -471,12 +487,11 @@ func (p *Proxy) Ensure(client *http.Client, ensureRequests int) error {
 	// Encode the Ensure-Request header
 	req.Header.Set("Ensure-Requests", strconv.Itoa(ensureRequests))
 
-	p.debugPrint(2, "Sending ensure request to proxy %v: %v", proxyOrdinal, proxyURL.String())
+	p.debugPrint(2, "Sending ensure request to: %v", p.Service.String())
 
 	// Do the request
 	resp, err := client.Do(req)
 	if err != nil {
-		p.markProxyPodAsDead(proxyOrdinal)
 		return err
 	}
 

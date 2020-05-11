@@ -84,6 +84,5 @@ will immediately reflect these changes.
   to scale itself down when it is not required to sustain throughput due to the idle timeout.
 - The client library bases its routing decisions on statistics
   returned from the proxies on each response or from a "ping". Pings are only sent if no requests have been sent to a proxy for a certain amount of time, so the client is aware of any down-scaling.
-- The proxies do not have any retry logic. Any failure, from the final
-  destination or from within the proxy, will be returned to the client to
-  decide whether a retry is needed.
+- The proxies themselves do not have any retry logic. Any failure, from the final
+  destination or from within the proxy, will be returned to the client. However, the client library has retry logic by default incase a proxy has terminated.
