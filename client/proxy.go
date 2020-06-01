@@ -442,8 +442,12 @@ func (p *Proxy) Do(client *http.Client, req *http.Request) (*http.Response, erro
 		req.Header.Set("Forward-To", req.URL.String())
 		req.URL = proxyURL
 
-		if transport, ok := client.Transport.(*http.Transport); ok && transport.TLSClientConfig.InsecureSkipVerify {
-			req.Header.Set("Insecure-Skip-Verify", "true")
+		// Pass along the client's TLS setting for the Proxy to use
+		transport, ok := client.Transport.(*http.Transport)
+		if ok && transport.TLSClientConfig != nil {
+			if transport.TLSClientConfig.InsecureSkipVerify {
+				req.Header.Set("Insecure-Skip-Verify", "true")
+			}
 		}
 
 		resp, err := client.Do(req)
