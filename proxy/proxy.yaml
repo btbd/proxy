@@ -50,6 +50,11 @@ metadata:
         proxyTimeout: "100"
         idleTimeout: "10"
         debugLevel: "1"
+        maxIdleConns: "2000"
+        maxIdleConnsPerHost: "2000"
+        maxConnsPerHost: "700"
+        idleConnTimeout: "90"
+        tlsHandshakeTimeout: "10"
 spec:
     selector:
         matchLabels:
