@@ -39,6 +39,8 @@ var ProxyOrdinal = getProxyOrdinal(ProxyName)
 
 var kubeClient *kubernetes.Clientset
 
+var httpClient http.Client
+
 // Info of StatefulSet
 var proxies struct {
 	Count   int64
@@ -71,6 +73,12 @@ var config struct {
 	ProxyTimeout  int64
 	IdleTimeout   int64
 	DebugLevel    int64
+	//HTTP client transport implementation variables
+	MaxIdleConns        int
+	MaxIdleConnsPerHost int
+	MaxConnsPerHost     int
+	IdleConnTimeout     int64
+	TLSHandshakeTimeout int64
 
 	// HTTP config comes from readiness probe
 	HTTP struct {
@@ -303,7 +311,6 @@ func doAsyncProxyRequest(w http.ResponseWriter, proxyRequest *http.Request, inse
 		}()
 
 		// Do the request
-		var httpClient http.Client
 		if insecureSkipVerify {
 			httpClient.Transport = &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -375,6 +382,7 @@ func doAsyncProxyRequest(w http.ResponseWriter, proxyRequest *http.Request, inse
 
 // Starts the HTTP server
 func startServer() {
+	setUpClient()
 	http.HandleFunc(config.HTTP.Path, httpHandler)
 
 	debugPrint(1, "[+] Listening on port %v (path \"%v\")", config.HTTP.Port, config.HTTP.Path)
@@ -622,6 +630,31 @@ func updateProxyConfig(annotations map[string]string) error {
 		return err
 	}
 
+	newMaxIdleConns, err := getOptionalConfigValue(annotations, "maxIdleConns", 2000)
+	if err != nil {
+		return err
+	}
+
+	newMaxIdleConnsPerHost, err := getOptionalConfigValue(annotations, "maxIdleConnsPerHost", 2000)
+	if err != nil {
+		return err
+	}
+
+	newMaxConnsPerHost, err := getOptionalConfigValue(annotations, "maxConnsPerHost", 700)
+	if err != nil {
+		return err
+	}
+
+	newIdleConnTimeout, err := getOptionalConfigValue(annotations, "idleConnTimeout", 90)
+	if err != nil {
+		return err
+	}
+
+	newTLSHandshakeTimeout, err := getOptionalConfigValue(annotations, "tlsHandshakeTimeout", 10)
+	if err != nil {
+		return err
+	}
+
 	// Begin shared lock for idle shutdown
 	state.IdleShutdown.RLock()
 	defer state.IdleShutdown.RUnlock()
@@ -639,6 +672,11 @@ func updateProxyConfig(annotations map[string]string) error {
 	config.ProxyTimeout = int64(newProxyTimeout)
 	config.IdleTimeout = int64(newIdleTimeout)
 	config.DebugLevel = int64(newDebugLevel)
+	config.MaxIdleConns = int(newMaxIdleConns)
+	config.MaxIdleConnsPerHost = int(newMaxIdleConnsPerHost)
+	config.MaxConnsPerHost = int(newMaxConnsPerHost)
+	config.IdleConnTimeout = int64(newIdleConnTimeout)
+	config.TLSHandshakeTimeout = int64(newTLSHandshakeTimeout)
 
 	// If we are the last proxy, ensure the min/max number of proxies
 	if ProxyOrdinal+1 == proxies.Count {
@@ -742,11 +780,21 @@ func printStats() {
 	}()
 }
 
+func setUpClient() {
+	netHTTPTransport := &http.Transport{
+		MaxIdleConns:        config.MaxIdleConns,
+		MaxIdleConnsPerHost: config.MaxIdleConnsPerHost,
+		MaxConnsPerHost:     config.MaxConnsPerHost,
+		IdleConnTimeout:     time.Duration(config.IdleConnTimeout),
+		TLSHandshakeTimeout: time.Duration(config.TLSHandshakeTimeout),
+	}
+
+	httpClient.Transport = netHTTPTransport
+}
+
 func main() {
 	startWatcher()
 	setupIdleShutdown()
-
 	printStats()
-
 	startServer()
 }
