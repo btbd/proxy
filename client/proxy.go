@@ -61,6 +61,10 @@ type Config struct {
 	// Attempts is an upper bound of attempts to make a proxy request before giving up
 	Attempts uint
 
+	// WebhookCallbackURL is the URL of a webhook to trigger when a request fails
+	// on the proxy's end after the timeout has expired
+	WebhookCallbackURL string
+
 	// PingClient is the HTTP client to use for ping requests
 	PingClient *http.Client
 
@@ -438,18 +442,18 @@ func (p *Proxy) Do(client *http.Client, req *http.Request) (*http.Response, erro
 		p.debugPrint(3, "Sending request to proxy %v: %v", proxyOrdinal, proxyURL.String())
 		p.Unlock()
 
-		// Do the actual request
-		req.Header.Set("Forward-To", req.URL.String())
-		req.URL = proxyURL
+		// Set headers
+		req.Header.Set("Proxy-Forward-To", req.URL.String())
+		req.Header.Set("Proxy-Webhook-Callback", p.WebhookCallbackURL)
 
 		// Pass along the client's TLS setting for the Proxy to use
 		transport, ok := client.Transport.(*http.Transport)
-		if ok && transport.TLSClientConfig != nil {
-			if transport.TLSClientConfig.InsecureSkipVerify {
-				req.Header.Set("Insecure-Skip-Verify", "true")
-			}
+		if ok && transport.TLSClientConfig != nil && transport.TLSClientConfig.InsecureSkipVerify {
+			req.Header.Set("Proxy-Insecure-Skip-Verify", "true")
 		}
 
+		// Do the actual request
+		req.URL = proxyURL
 		resp, err := client.Do(req)
 		if err != nil {
 			if proxyOrdinal >= 0 {
@@ -489,7 +493,7 @@ func (p *Proxy) Ensure(client *http.Client, ensureRequests int) error {
 	}
 
 	// Encode the Ensure-Request header
-	req.Header.Set("Ensure-Requests", strconv.Itoa(ensureRequests))
+	req.Header.Set("Proxy-Ensure-Requests", strconv.Itoa(ensureRequests))
 
 	p.debugPrint(2, "Sending ensure request to: %v", p.Service.String())
 

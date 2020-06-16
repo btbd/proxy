@@ -79,6 +79,9 @@ var config struct {
 	}
 }
 
+// WebhookCallback is the function to trigger if the timeout expired and the response was a failure
+type WebhookCallback func(*http.Client, string) error
+
 func debugPrint(level int, format string, args ...interface{}) {
 	if int64(level) > config.DebugLevel {
 		return
@@ -189,8 +192,8 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Forward-To is the host to forward the request to
-	forwardTo := strings.TrimSpace(r.Header.Get("Forward-To"))
+	// Proxy-Forward-To is the host to forward the request to
+	forwardTo := strings.TrimSpace(r.Header.Get("Proxy-Forward-To"))
 
 	// Is there no Forward-To header?
 	if forwardTo == "" {
@@ -222,8 +225,16 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 
 	state.ActiveRequestsMu.Unlock()
 
-	// Delete the Forward-To header for when we copy the request to proxy it
-	r.Header.Del("Forward-To")
+	// The webhook callback to trigger on failures
+	webhookCallbackURL := strings.TrimSpace(r.Header.Get("Proxy-Webhook-Callback"))
+
+	// Whether this request wants to ignore bad TLS
+	insecureSkipVerify := strings.ToLower(strings.TrimSpace(r.Header.Get("Proxy-Insecure-Skip-Verify"))) == "true"
+
+	// Delete proxy specific headers
+	r.Header.Del("Proxy-Forward-To")
+	r.Header.Del("Proxy-Insecure-Skip-Verify")
+	r.Header.Del("Proxy-Webhook-Callback")
 
 	// Read the body to copy it
 	body, err := ioutil.ReadAll(r.Body)
@@ -246,13 +257,38 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	// Copy the headers
 	proxyRequest.Header = r.Header
 
+	// Setup the webhook callback if necessary
+	var webhookCallback WebhookCallback
+	if webhookCallbackURL != "" {
+		webhookCallback = func(httpClient *http.Client, errorMsg string) error {
+			// Forward the request that failed to the webhook
+			webhookRequest, err := http.NewRequest(r.Method, webhookCallbackURL, bytes.NewReader(body))
+			if err != nil {
+				return err
+			}
+
+			// Set the headers
+			webhookRequest.Header = r.Header
+			webhookRequest.Header.Set("Proxy-Error", errorMsg)
+
+			// Do the webhook request
+			resp, err := httpClient.Do(webhookRequest)
+			if err != nil {
+				return err
+			}
+
+			resp.Body.Close()
+			return nil
+		}
+	}
+
 	// Do the actual request
-	doAsyncProxyRequest(w, proxyRequest, strings.ToLower(strings.TrimSpace(r.Header.Get("Insecure-Skip-Verify"))) == "true")
+	doAsyncProxyRequest(w, proxyRequest, insecureSkipVerify, webhookCallback)
 }
 
 // Handles an ensure request if it exists, returns false if none exists
 func handleEnsureRequest(w http.ResponseWriter, r *http.Request) bool {
-	ensure := strings.TrimSpace(r.Header.Get("Ensure-Requests"))
+	ensure := strings.TrimSpace(r.Header.Get("Proxy-Ensure-Requests"))
 	if ensure == "" {
 		return false
 	}
@@ -284,8 +320,13 @@ func handleEnsureRequest(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // Does an async proxy request and returns the status code if returned before the timeout
-func doAsyncProxyRequest(w http.ResponseWriter, proxyRequest *http.Request, insecureSkipVerify bool) {
+func doAsyncProxyRequest(w http.ResponseWriter, proxyRequest *http.Request, insecureSkipVerify bool, webhookCallback func(*http.Client, string) error) {
+	// The timeout channel to create non-blocking behavior
 	timeoutChan := make(chan bool, 2)
+
+	// This flag is used to synchronize whether a request to the webhook callback is necessary
+	timedOut := false
+	timedOutMu := sync.Mutex{}
 
 	var requestResponse *http.Response
 	var requestResponseBody []byte
@@ -312,11 +353,17 @@ func doAsyncProxyRequest(w http.ResponseWriter, proxyRequest *http.Request, inse
 
 		requestResponse, requestError = httpClient.Do(proxyRequest)
 
+		// Lock now as we have gotten a response back
+		timedOutMu.Lock()
+
+		// The webhook error to pass on
+		var webhookError error
+
 		// Was there no error?
 		if requestError == nil {
 			defer requestResponse.Body.Close()
 
-			// Read the body
+			// Success, read in the response body
 			if body, err := ioutil.ReadAll(requestResponse.Body); err == nil {
 				requestResponseBody = body
 			} else {
@@ -324,21 +371,44 @@ func doAsyncProxyRequest(w http.ResponseWriter, proxyRequest *http.Request, inse
 
 				debugPrint(2, "[!] Failed to read request to %v response body from: %v", proxyRequest.URL.String(), requestError)
 			}
+
+			// Is this a non-success status code?
+			if requestResponse.StatusCode/100 != 2 {
+				webhookError = fmt.Errorf("%d - %s", requestResponse.StatusCode, http.StatusText(requestResponse.StatusCode))
+			}
 		} else {
 			debugPrint(2, "[!] Request to %v failed: %v", proxyRequest.URL.String(), requestError)
+			webhookError = requestError
 		}
 
-		// We did not timeout, request finished
+		// Indicate the request finished and the relevant data is set
 		timeoutChan <- false
+
+		// Determine if we should trigger the webhook (has the timed out flag already been set?)
+		shouldTriggerWebhook := timedOut && webhookError != nil && webhookCallback != nil
+
+		timedOutMu.Unlock()
+
+		// Trigger the webhook if necessary
+		if shouldTriggerWebhook {
+			if err := webhookCallback(&httpClient, webhookError.Error()); err != nil {
+				debugPrint(2, "[!] Webhook callback request failed: %v\n", err)
+			}
+		}
 	}()
 
 	// Start the timeout
 	go func() {
 		// Sleep for the timeout then notify the timeout channel
 		time.Sleep(time.Duration(config.ProxyTimeout) * time.Millisecond)
+
+		timedOutMu.Lock()
 		timeoutChan <- true
+		timedOut = true
+		timedOutMu.Unlock()
 	}()
 
+	// Whichever routine writes to the channel first will determine the outcome
 	if <-timeoutChan {
 		// We did timeout, request still being processed
 		writeProxyMetrics(w, http.StatusAccepted)
