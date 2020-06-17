@@ -1,6 +1,6 @@
 FROM golang:1.14
-RUN go get k8s.io/klog && cd $GOPATH/src/k8s.io/klog && git checkout v0.4.0
-RUN go get "k8s.io/api/apps/v1" && \
+RUN go get "k8s.io/klog" && \
+    go get "k8s.io/api/apps/v1" && \
     go get "k8s.io/api/autoscaling/v1" && \
     go get "k8s.io/api/core/v1" && \
     go get "k8s.io/apimachinery/pkg/apis/meta/v1" && \
