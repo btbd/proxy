@@ -444,7 +444,7 @@ func (p *Proxy) Do(client *http.Client, req *http.Request) (*http.Response, erro
 
 		// Set headers
 		req.Header.Set("Proxy-Forward-To", req.URL.String())
-		req.Header.Set("Proxy-Webhook-Callback", p.WebhookCallbackURL)
+		req.Header.Set("Proxy-Webhook-Callback", p.Config.WebhookCallbackURL)
 
 		// Pass along the client's TLS setting for the Proxy to use
 		transport, ok := client.Transport.(*http.Transport)
